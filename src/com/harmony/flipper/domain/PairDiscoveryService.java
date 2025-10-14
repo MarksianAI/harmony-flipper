@@ -16,60 +16,40 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
-/**
- * Discovers high-correlation pairs using per-item deviation vs 24h averages.
- * - Maintains a rolling buffer of deviation(%) per item.
- * - Periodically scans the top-N volume items and computes pairwise correlations.
- * - Emits pair candidates with corr >= config.strategies.pairsTrading.minCorrelation.
- */
 @Singleton
 public final class PairDiscoveryService implements Service {
 
     private final FlipService flipService;
     private final Config config;
 
-    /** Rolling deviation buffers per item (percent deviation vs 24h avg low). */
     private final Map<Integer, DoubleRingBuffer> devBuffers = new ConcurrentHashMap<>();
-
-    /** Optional rolling spread buffers for pairs that pass correlation (for Z-score). */
     private final Map<PairTradingService.PairKey, DoubleRingBuffer> spreadBuffers = new ConcurrentHashMap<>();
 
-    /** Last discovered candidates snapshot. */
     private volatile List<PairCandidate> lastCandidates = List.of();
 
-    /** Configuration-ish knobs (kept internal so we don't add new Config fields). */
-    private static final int TOP_N_BY_VOLUME = 300;      // scan top-N liquid items
-    private static final int SCAN_EVERY_TICKS = 30;      // compute correlations every N ticks
-    private static final int MIN_SAMPLES_FOR_CORR = 30;  // need at least this many aligned samples
+    private static final int TOP_N_BY_VOLUME = 300;
+    private static final int SCAN_EVERY_TICKS = 30;
+    private static final int MIN_SAMPLES_FOR_CORR = 30;
     private static final int MAX_OUTPUT_CANDIDATES = 100;
 
     private int tickSinceScan = 0;
 
     public static final class PairCandidate {
         public final PairTradingService.PairKey key;
-        public final String nameA;
-        public final String nameB;
+        public final String nameA, nameB;
         public final double correlation;
         public final int samples;
-        public final double devA;          // latest deviation (%) A
-        public final double devB;          // latest deviation (%) B
-        public final double spread;        // devA - devB (latest)
-        public final Double spreadZ;       // optional (null if insufficient spread history)
+        public final double devA, devB, spread;
+        public final Double spreadZ;
         public final int combinedVolume24h;
 
         public PairCandidate(PairTradingService.PairKey key, String nameA, String nameB,
                              double correlation, int samples,
                              double devA, double devB, double spread, Double spreadZ,
                              int combinedVolume24h) {
-            this.key = key;
-            this.nameA = nameA;
-            this.nameB = nameB;
-            this.correlation = correlation;
-            this.samples = samples;
-            this.devA = devA;
-            this.devB = devB;
-            this.spread = spread;
-            this.spreadZ = spreadZ;
+            this.key = key; this.nameA = nameA; this.nameB = nameB;
+            this.correlation = correlation; this.samples = samples;
+            this.devA = devA; this.devB = devB; this.spread = spread; this.spreadZ = spreadZ;
             this.combinedVolume24h = combinedVolume24h;
         }
     }
@@ -80,71 +60,44 @@ public final class PairDiscoveryService implements Service {
         this.config = Objects.requireNonNull(config);
     }
 
-    /** Latest snapshot of discovered pair candidates. */
-    public List<PairCandidate> getCandidates() {
-        return lastCandidates;
-    }
+    public List<PairCandidate> getCandidates() { return lastCandidates; }
 
     @Subscribe
     public void onTick(TickEvent tick) {
         if (!flipService.isReady()) return;
 
-        // 1) Update per-item deviation buffers
-        updateDeviationBuffers();
-
-        // 2) Periodically scan for pairs
-        tickSinceScan++;
-        if (tickSinceScan >= Math.max(1, SCAN_EVERY_TICKS)) {
-            tickSinceScan = 0;
-            try {
-                lastCandidates = discoverPairs();
-            } catch (Exception ex) {
-                Log.severe("PairDiscoveryService: discovery failed: " + ex.getMessage());
-                lastCandidates = List.of();
-            }
-        }
-    }
-
-    // ---------- internals ----------
-
-    private void updateDeviationBuffers() {
         var mapping = flipService.getItemMapping();
         var latest  = flipService.getLatestPrices();
         var day     = flipService.getPrices24h();
         var volumes = flipService.getItemVolumes();
 
-        boolean membersOnly = config.filters.membersOnly;
-        int minVolume = Math.max(0, config.filters.minVolume);
-        int minBuyLimit = Math.max(0, config.filters.minBuyLimit);
-        int maxUnitPrice = Math.max(1, config.risk.maxPricePerUnit);
-
-        // window length taken from pairs config
         int window = Math.max(10, config.strategies.pairsTrading.correlationWindow);
 
-        for (int itemId : flipService.getItemIds()) {
-            ItemInfo info = mapping.get(itemId);
-            PriceData p = latest.get(itemId);
-            FlipService.IntervalData d = day.get(itemId);
-            Integer vol = volumes.get(itemId);
-            if (info == null || p == null || d == null || vol == null) continue;
+        for (int id : flipService.getItemIds()) {
+            ItemInfo info = mapping.get(id);
+            PriceData p   = latest.get(id);
+            FlipService.IntervalData d = day.get(id);
+            Integer vol = volumes.get(id);
 
-            if (membersOnly && !info.members) continue;
-            if (vol < minVolume) continue;
-            int limit = info.limit != null ? info.limit : Integer.MAX_VALUE;
-            if (limit < minBuyLimit) continue;
-            if (p.low <= 0 || d.avgLowPrice <= 0) continue;
-            if (p.low > maxUnitPrice) continue;
+            if (!basicFilter(info, p, vol)) continue;
+            if (d == null || d.avgLowPrice <= 0) continue;
 
-            // Deviation (%) = how far below 24h mean (positive => below mean)
             double devPct = (d.avgLowPrice - p.low) * 100.0 / d.avgLowPrice;
 
-            // Buffer
-            DoubleRingBuffer buf = devBuffers.get(itemId);
-            if (buf == null || buf.capacity() != window) {
-                buf = new DoubleRingBuffer(window); // resize if config changed
-                devBuffers.put(itemId, buf);
-            }
+            DoubleRingBuffer buf = devBuffers.computeIfAbsent(id, k -> new DoubleRingBuffer(window));
+            if (buf.capacity() != window) devBuffers.put(id, buf = new DoubleRingBuffer(window));
             buf.add(devPct);
+        }
+
+        tickSinceScan++;
+        if (tickSinceScan < Math.max(1, SCAN_EVERY_TICKS)) return;
+        tickSinceScan = 0;
+
+        try {
+            lastCandidates = discoverPairs();
+        } catch (Exception ex) {
+            Log.severe("PairDiscoveryService: discovery failed: " + ex.getMessage());
+            lastCandidates = List.of();
         }
     }
 
@@ -152,28 +105,27 @@ public final class PairDiscoveryService implements Service {
         var mapping = flipService.getItemMapping();
         var volumes = flipService.getItemVolumes();
 
-        // 1) Candidate universe: top-N by volume with sufficiently long buffers
-        List<Integer> topByVolume = volumes.entrySet().stream()
+        List<Integer> universe = volumes.entrySet().stream()
                 .sorted(Map.Entry.<Integer, Integer>comparingByValue().reversed())
                 .limit(TOP_N_BY_VOLUME)
                 .map(Map.Entry::getKey)
-                .filter(devBuffers::containsKey)
-                .filter(id -> devBuffers.get(id).size() >= Math.max(MIN_SAMPLES_FOR_CORR,
-                        Math.min(60, config.strategies.pairsTrading.correlationWindow / 2)))
+                .filter(id -> {
+                    DoubleRingBuffer b = devBuffers.get(id);
+                    return b != null && b.size() >= Math.max(MIN_SAMPLES_FOR_CORR, config.strategies.pairsTrading.correlationWindow / 2);
+                })
                 .collect(Collectors.toList());
 
         double minCorr = config.strategies.pairsTrading.minCorrelation;
+        int window = Math.max(30, config.strategies.pairsTrading.correlationWindow);
 
         List<PairCandidate> out = new ArrayList<>(64);
-
-        // 2) Pairwise correlation scan (O(N^2) on ~300 => ~45k pairs; acceptable every SCAN_EVERY_TICKS)
-        for (int i = 0; i < topByVolume.size(); i++) {
-            int a = topByVolume.get(i);
+        for (int i = 0; i < universe.size(); i++) {
+            int a = universe.get(i);
             DoubleRingBuffer ba = devBuffers.get(a);
             if (ba == null) continue;
 
-            for (int j = i + 1; j < topByVolume.size(); j++) {
-                int b = topByVolume.get(j);
+            for (int j = i + 1; j < universe.size(); j++) {
+                int b = universe.get(j);
                 DoubleRingBuffer bb = devBuffers.get(b);
                 if (bb == null) continue;
 
@@ -183,22 +135,20 @@ public final class PairDiscoveryService implements Service {
                 double corr = ba.correlation(bb);
                 if (corr < minCorr) continue;
 
-                // Stats for output
                 double devA = ba.last();
                 double devB = bb.last();
                 double spread = devA - devB;
 
-                // Optional: keep a small spread buffer only for "passing" pairs to compute a Z-score
-                PairTradingService.PairKey key = new PairTradingService.PairKey(a, b);
-                DoubleRingBuffer sbuf = spreadBuffers.computeIfAbsent(key, k -> new DoubleRingBuffer(Math.max(30, config.strategies.pairsTrading.correlationWindow)));
+                var key = new PairTradingService.PairKey(a, b);
+                DoubleRingBuffer sbuf = spreadBuffers.computeIfAbsent(key, k -> new DoubleRingBuffer(window));
+                if (sbuf.capacity() != window) spreadBuffers.put(key, sbuf = new DoubleRingBuffer(window));
                 sbuf.add(spread);
-                Double z = null;
-                double std = sbuf.std();
-                if (sbuf.size() >= 10 && std > 0) {
-                    z = (spread - sbuf.mean()) / std;
-                }
 
-                int combVol = getOrZero(volumes, a) + getOrZero(volumes, b);
+                Double z = null;
+                if (sbuf.size() >= 10 && sbuf.std() > 0) z = (spread - sbuf.mean()) / sbuf.std();
+
+                int volA = volumes.getOrDefault(a, 0);
+                int volB = volumes.getOrDefault(b, 0);
                 String nameA = mapping.containsKey(a) ? mapping.get(a).name : String.valueOf(a);
                 String nameB = mapping.containsKey(b) ? mapping.get(b).name : String.valueOf(b);
 
@@ -206,12 +156,11 @@ public final class PairDiscoveryService implements Service {
                         key, nameA, nameB,
                         NumberUtils.round4(corr), samples,
                         NumberUtils.round2(devA), NumberUtils.round2(devB), NumberUtils.round2(spread),
-                        (z == null ? null : NumberUtils.round2(z)), combVol
+                        (z == null ? null : NumberUtils.round2(z)), volA + volB
                 ));
             }
         }
 
-        // 3) Rank: prefer high correlation, then |spreadZ| if available, then combined volume
         return out.stream()
                 .sorted((p1, p2) -> {
                     int c = Double.compare(p2.correlation, p1.correlation);
@@ -226,5 +175,12 @@ public final class PairDiscoveryService implements Service {
                 .collect(Collectors.toUnmodifiableList());
     }
 
-    private static int getOrZero(Map<Integer, Integer> m, int k) { return m.getOrDefault(k, 0); }
+    private boolean basicFilter(ItemInfo info, PriceData p, Integer volume) {
+        if (info == null || p == null || volume == null) return false;
+        if (config.filters.membersOnly && !info.members) return false;
+        if (volume < Math.max(0, config.filters.minVolume)) return false;
+        if ((info.limit != null ? info.limit : Integer.MAX_VALUE) < Math.max(0, config.filters.minBuyLimit)) return false;
+        if (p.low <= 0 || p.low > Math.max(1, config.risk.maxPricePerUnit)) return false;
+        return true;
+    }
 }

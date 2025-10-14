@@ -30,27 +30,37 @@ public final class DoubleRingBuffer {
     }
 
     public double mean() {
-        if (size == 0) {
+        return mean(size);
+    }
+
+    public double mean(int samples) {
+        int n = Math.min(Math.max(samples, 0), size);
+        if (n == 0) {
             return 0.0;
         }
         double sum = 0.0;
-        for (int i = 0; i < size; i++) {
-            sum += values[i];
+        for (int i = 0; i < n; i++) {
+            sum += getFromEnd(i);
         }
-        return sum / size;
+        return sum / n;
     }
 
     public double std() {
-        if (size < 2) {
+        return std(size);
+    }
+
+    public double std(int samples) {
+        int n = Math.min(Math.max(samples, 0), size);
+        if (n < 2) {
             return 0.0;
         }
-        double mean = mean();
+        double mean = mean(n);
         double sumSq = 0.0;
-        for (int i = 0; i < size; i++) {
-            double delta = values[i] - mean;
+        for (int i = 0; i < n; i++) {
+            double delta = getFromEnd(i) - mean;
             sumSq += delta * delta;
         }
-        return Math.sqrt(sumSq / (size - 1));
+        return Math.sqrt(sumSq / (n - 1));
     }
 
     public double correlation(DoubleRingBuffer other) {

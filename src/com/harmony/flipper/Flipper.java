@@ -2,7 +2,7 @@ package com.harmony.flipper;
 
 
 import com.harmony.flipper.config.Config;
-import com.harmony.flipper.domain.FlipService;
+import com.harmony.flipper.domain.*;
 import com.harmony.flipper.task.BuyTask;
 import com.harmony.flipper.task.SellTask;
 import org.rspeer.commons.ArrayUtils;
@@ -23,7 +23,11 @@ public class Flipper extends TaskScript {
     @Override
     public Class<? extends Service>[] getServices() {
         return ArrayUtils.getTypeSafeArray(
-                FlipService.class
+                FlipService.class,
+                BidAskService.class,
+                MeanReversionService.class,
+                PairDiscoveryService.class,
+                PairTradingService.class
         );
     }
 
@@ -35,9 +39,4 @@ public class Flipper extends TaskScript {
         );
     }
 
-    @Override
-    public void initialize() {
-        FlipService flipService = getInjector().getInstance(FlipService.class);
-        flipService.preload();
-    }
 }

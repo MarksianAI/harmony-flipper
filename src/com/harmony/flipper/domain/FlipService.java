@@ -12,6 +12,7 @@ import org.rspeer.commons.logging.Log;
 import org.rspeer.event.Service;
 import org.rspeer.event.Subscribe;
 import org.rspeer.game.event.TickEvent;
+import org.rspeer.game.Game;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -20,6 +21,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Maintains OSRS Wiki price metadata and exposes immutable snapshots for consumers.
@@ -41,18 +43,17 @@ public final class FlipService implements Service {
     private static final int HTTP_ATTEMPTS      = 3;
 
     // Staleness / refresh cadences
-    private static final int DEFAULT_STALE_SECONDS        = 600;   // latest high/low times
-    private static final int REFRESH_LATEST_SECONDS       = 60;    // re-pull /latest at most once per minute
-    private static final int REFRESH_VOLUMES_SECONDS      = 300;   // re-pull /volumes every 5 min
-    private static final int REFRESH_INTERVAL_24H_SECONDS = 300;   // re-pull /24h every 5 min (sliding window)
-    private static final int REFRESH_INTERVAL_1H_SECONDS  = 300;   // re-pull /1h every 5 min
+    private static final int REFRESH_LATEST_TICKS       = 100;   // re-pull /latest at most once per minute
+    private static final int REFRESH_VOLUMES_TICKS      = 500;   // re-pull /volumes every 5 min
+    private static final int REFRESH_INTERVAL_24H_TICKS = 500;   // re-pull /24h every 5 min (sliding window)
+    private static final int REFRESH_INTERVAL_1H_TICKS  = 500;   // re-pull /1h every 5 min
 
     private final Config config;
     private final String userAgent;
 
-    private final Map<Integer, ItemInfo> itemMapping   = new HashMap<>();
-    private final Map<Integer, PriceData> latestPrices = new HashMap<>();
-    private final Map<Integer, Integer> itemVolumes    = new HashMap<>();
+    private final Map<Integer, ItemInfo> itemMapping   = new ConcurrentHashMap<>();
+    private final Map<Integer, PriceData> latestPrices = new ConcurrentHashMap<>();
+    private final Map<Integer, Integer> itemVolumes    = new ConcurrentHashMap<>();
 
     // Interval stats
     public static final class IntervalData {
@@ -69,16 +70,16 @@ public final class FlipService implements Service {
         }
     }
 
-    private final Map<Integer, IntervalData> prices24h = new HashMap<>();
-    private final Map<Integer, IntervalData> prices1h  = new HashMap<>();
+    private final Map<Integer, IntervalData> prices24h = new ConcurrentHashMap<>();
+    private final Map<Integer, IntervalData> prices1h  = new ConcurrentHashMap<>();
 
-    private boolean mappingLoaded = false;
+    private volatile boolean mappingLoaded = false;
     private int tickCounter = 0;
 
-    private long lastLatestFetchEpoch  = 0;
-    private long lastVolumesFetchEpoch = 0;
-    private long last24hFetchEpoch     = 0;
-    private long last1hFetchEpoch      = 0;
+    private volatile long lastLatestFetchTick  = Long.MIN_VALUE;
+    private volatile long lastVolumesFetchTick = Long.MIN_VALUE;
+    private volatile long last24hFetchTick     = Long.MIN_VALUE;
+    private volatile long last1hFetchTick      = Long.MIN_VALUE;
 
     @Inject
     public FlipService(Config config) {
@@ -86,34 +87,55 @@ public final class FlipService implements Service {
         this.userAgent = sanitizeUA(config.advanced.userAgent);
     }
 
-    /**
-     * Eagerly loads the mapping if not already loaded.
-     */
-    public void preload() {
-        ensureMappingLoaded();
-    }
-
     @Subscribe
     public void onTick(TickEvent event) {
-        ensureMappingLoaded();
+        if (!mappingLoaded) {
+            try {
+                JSONArray array = new JSONArray(httpGet(MAPPING_URL));
+                itemMapping.clear();
 
-        if (!shouldUpdateThisTick()) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject obj = array.getJSONObject(i);
+                    int id = obj.getInt("id");
+                    String name = obj.getString("name");
+                    String examine = obj.optString("examine", "");
+                    boolean members = obj.optBoolean("members", false);
+                    int lowAlch = obj.optInt("lowalch", 0);
+                    int highAlch = obj.optInt("highalch", 0);
+                    Integer limit = obj.has("limit") ? obj.getInt("limit") : null;
+                    itemMapping.put(id, new ItemInfo(id, name, examine, members, lowAlch, highAlch, limit));
+                }
+
+                mappingLoaded = true;
+                Log.info("FlipService: loaded item mapping (" + itemMapping.size() + " items)");
+                refreshSnapshot(H24_URL, data -> loadIntervals(data, prices24h), tick -> last24hFetchTick = tick, "24h stats");
+                refreshSnapshot(H1_URL, data -> loadIntervals(data, prices1h), tick -> last1hFetchTick = tick, "1h stats");
+                refreshSnapshot(VOLUMES_URL, this::loadVolumes, tick -> lastVolumesFetchTick = tick, "volumes");
+                refreshSnapshot(LATEST_URL, this::loadLatest, tick -> lastLatestFetchTick = tick, "latest prices");
+            } catch (IOException | JSONException ex) {
+                Log.severe("FlipService: failed to fetch item mapping: " + ex.getMessage());
+            }
+            return;
+        }
+
+        int throttle = Math.max(1, config.advanced.tickThrottle);
+        if (tickCounter < throttle) {
+            tickCounter++;
             return;
         }
         tickCounter = 0;
 
-        // Periodic updates, lightly rate-limited
-        if (shouldRefresh(lastLatestFetchEpoch, REFRESH_LATEST_SECONDS)) {
-            fetchLatestWithLogging();
+        if (shouldRefresh(lastLatestFetchTick, REFRESH_LATEST_TICKS)) {
+            refreshSnapshot(LATEST_URL, this::loadLatest, tick -> lastLatestFetchTick = tick, "latest prices");
         }
-        if (shouldRefresh(lastVolumesFetchEpoch, REFRESH_VOLUMES_SECONDS)) {
-            fetchVolumesWithLogging();
+        if (shouldRefresh(lastVolumesFetchTick, REFRESH_VOLUMES_TICKS)) {
+            refreshSnapshot(VOLUMES_URL, this::loadVolumes, tick -> lastVolumesFetchTick = tick, "volumes");
         }
-        if (shouldRefresh(last24hFetchEpoch, REFRESH_INTERVAL_24H_SECONDS)) {
-            fetch24hWithLogging();
+        if (shouldRefresh(last24hFetchTick, REFRESH_INTERVAL_24H_TICKS)) {
+            refreshSnapshot(H24_URL, data -> loadIntervals(data, prices24h), tick -> last24hFetchTick = tick, "24h stats");
         }
-        if (shouldRefresh(last1hFetchEpoch, REFRESH_INTERVAL_1H_SECONDS)) {
-            fetch1hWithLogging();
+        if (shouldRefresh(last1hFetchTick, REFRESH_INTERVAL_1H_TICKS)) {
+            refreshSnapshot(H1_URL, data -> loadIntervals(data, prices1h), tick -> last1hFetchTick = tick, "1h stats");
         }
     }
 
@@ -121,22 +143,19 @@ public final class FlipService implements Service {
      * @return true once mapping has loaded and price/volume + 24h stats are populated.
      */
     public boolean isReady() {
-        ensureMappingLoaded();
         return mappingLoaded
                 && !latestPrices.isEmpty()
                 && !itemVolumes.isEmpty()
-                && !prices24h.isEmpty(); // Require 24h for MR/Pair
+                && !prices24h.isEmpty();
     }
 
     /** @return immutable view of the item ids known to the service. */
     public Set<Integer> getItemIds() {
-        ensureMappingLoaded();
         return Set.copyOf(itemMapping.keySet());
     }
 
     /** @return immutable view of the item mapping. */
     public Map<Integer, ItemInfo> getItemMapping() {
-        ensureMappingLoaded();
         return Collections.unmodifiableMap(itemMapping);
     }
 
@@ -162,7 +181,6 @@ public final class FlipService implements Service {
 
     /** Combines mapping, latest, volume into a row (without interval stats). */
     public MarketRow getMarketRow(int itemId) {
-        ensureMappingLoaded();
         ItemInfo info = itemMapping.get(itemId);
         PriceData price = latestPrices.get(itemId);
         Integer volume = itemVolumes.get(itemId);
@@ -172,79 +190,24 @@ public final class FlipService implements Service {
         return new MarketRow(info, price, volume);
     }
 
-    public long getLastLatestFetchEpoch()  { return lastLatestFetchEpoch; }
-    public long getLastVolumesFetchEpoch() { return lastVolumesFetchEpoch; }
-    public long getLast24hFetchEpoch()     { return last24hFetchEpoch; }
-    public long getLast1hFetchEpoch()      { return last1hFetchEpoch; }
+    public long getLastLatestFetchTick()  { return lastLatestFetchTick; }
+    public long getLastVolumesFetchTick() { return lastVolumesFetchTick; }
+    public long getLast24hFetchTick()     { return last24hFetchTick; }
+    public long getLast1hFetchTick()      { return last1hFetchTick; }
 
-    /** Determines whether the provided price snapshot is stale. */
-    public boolean isStale(PriceData price) {
-        Objects.requireNonNull(price, "price");
-        long newest = Math.max(price.highTime, price.lowTime);
-        if (newest <= 0) return true;
-        return epochSeconds() - newest > DEFAULT_STALE_SECONDS;
-    }
 
     // ---------- internals ----------
 
-    private boolean shouldUpdateThisTick() {
-        tickCounter++;
-        int throttle = Math.max(1, config.advanced.tickThrottle);
-        return tickCounter >= throttle;
-    }
-
-    private boolean shouldRefresh(long lastEpoch, int minIntervalSeconds) {
-        long now = epochSeconds();
-        return (now - lastEpoch) >= minIntervalSeconds;
-    }
-
-    private void ensureMappingLoaded() {
-        if (mappingLoaded) {
-            return;
+    private boolean shouldRefresh(long lastTick, int minIntervalTicks) {
+        if (lastTick == Long.MIN_VALUE) {
+            return true;
         }
-        try {
-            loadMapping();
-            mappingLoaded = true;
-            Log.info("FlipService: loaded item mapping (" + itemMapping.size() + " items)");
-            fetch24hWithLogging();
-            fetch1hWithLogging();
-            fetchVolumesWithLogging();
-            fetchLatestWithLogging();
-        } catch (IOException | JSONException ex) {
-            Log.severe("FlipService: failed to fetch item mapping: " + ex.getMessage());
-        }
+
+        return (Game.getTickCount() - lastTick) >= minIntervalTicks;
     }
 
-    private void loadMapping() throws IOException, JSONException {
-        JSONArray array = new JSONArray(httpGet(MAPPING_URL));
-        itemMapping.clear();
-
-        for (int i = 0; i < array.length(); i++) {
-            JSONObject obj = array.getJSONObject(i);
-            int id = obj.getInt("id");
-            String name = obj.getString("name");
-            String examine = obj.optString("examine", "");
-            boolean members = obj.optBoolean("members", false);
-            int lowAlch = obj.optInt("lowalch", 0);
-            int highAlch = obj.optInt("highalch", 0);
-            Integer limit = obj.has("limit") ? obj.getInt("limit") : null;
-            itemMapping.put(id, new ItemInfo(id, name, examine, members, lowAlch, highAlch, limit));
-        }
-    }
-
-    private void fetchLatestWithLogging() {
-        try {
-            fetchLatest();
-        } catch (IOException | JSONException ex) {
-            Log.severe("FlipService: failed to fetch latest prices: " + ex.getMessage());
-        }
-    }
-
-    private void fetchLatest() throws IOException, JSONException {
-        JSONObject root = new JSONObject(httpGet(LATEST_URL));
-        JSONObject data = root.getJSONObject("data");
+    private void loadLatest(JSONObject data) throws JSONException {
         latestPrices.clear();
-
         Iterator<String> keys = data.keys();
         while (keys.hasNext()) {
             String idKey = keys.next();
@@ -259,22 +222,10 @@ public final class FlipService implements Service {
             long lowTime  = obj.optLong("lowTime", 0);
             latestPrices.put(id, new PriceData(id, high, low, highTime, lowTime));
         }
-        lastLatestFetchEpoch = epochSeconds();
     }
 
-    private void fetchVolumesWithLogging() {
-        try {
-            fetchVolumes();
-        } catch (IOException | JSONException ex) {
-            Log.severe("FlipService: failed to fetch volumes: " + ex.getMessage());
-        }
-    }
-
-    private void fetchVolumes() throws IOException, JSONException {
-        JSONObject root = new JSONObject(httpGet(VOLUMES_URL));
-        JSONObject data = root.getJSONObject("data");
+    private void loadVolumes(JSONObject data) throws JSONException {
         itemVolumes.clear();
-
         Iterator<String> keys = data.keys();
         while (keys.hasNext()) {
             String idKey = keys.next();
@@ -282,38 +233,14 @@ public final class FlipService implements Service {
             int volume = data.optInt(idKey, 0);
             itemVolumes.put(id, volume);
         }
-        lastVolumesFetchEpoch = epochSeconds();
     }
 
-    private void fetch24hWithLogging() {
-        try {
-            fetchIntervalInto(H24_URL, prices24h);
-            last24hFetchEpoch = epochSeconds();
-        } catch (IOException | JSONException ex) {
-            Log.severe("FlipService: failed to fetch 24h stats: " + ex.getMessage());
-        }
-    }
-
-    private void fetch1hWithLogging() {
-        try {
-            fetchIntervalInto(H1_URL, prices1h);
-            last1hFetchEpoch = epochSeconds();
-        } catch (IOException | JSONException ex) {
-            Log.severe("FlipService: failed to fetch 1h stats: " + ex.getMessage());
-        }
-    }
-
-    private void fetchIntervalInto(String url, Map<Integer, IntervalData> target) throws IOException, JSONException {
-        JSONObject root = new JSONObject(httpGet(url));
-        JSONObject data = root.getJSONObject("data");
+    private void loadIntervals(JSONObject data, Map<Integer, IntervalData> target) throws JSONException {
         target.clear();
-
         Iterator<String> keys = data.keys();
         while (keys.hasNext()) {
             String idKey = keys.next();
             JSONObject obj = data.getJSONObject(idKey);
-
-            // Fields per item for interval endpoints
             int avgHigh = obj.optInt("avgHighPrice", -1);
             int avgLow  = obj.optInt("avgLowPrice", -1);
             int highVol = obj.optInt("highPriceVolume", 0);
@@ -323,6 +250,19 @@ public final class FlipService implements Service {
             }
             int id = Integer.parseInt(idKey);
             target.put(id, new IntervalData(avgHigh, avgLow, highVol, lowVol));
+        }
+    }
+
+    private void refreshSnapshot(String url,
+                                 SnapshotLoader loader,
+                                 java.util.function.LongConsumer tickSetter,
+                                 String label) {
+        try {
+            JSONObject root = new JSONObject(httpGet(url));
+            loader.load(root.getJSONObject("data"));
+            tickSetter.accept(Game.getTickCount());
+        } catch (IOException | JSONException ex) {
+            Log.severe("FlipService: failed to fetch " + label + ": " + ex.getMessage());
         }
     }
 
@@ -339,7 +279,6 @@ public final class FlipService implements Service {
                     Log.fine("FlipService: attempt " + attempt + " failed for " + url + ": " + ex.getMessage());
                 }
             } finally {
-                //noinspection ConstantConditions
                 if (connection != null) {
                     connection.disconnect();
                 }
@@ -378,8 +317,9 @@ public final class FlipService implements Service {
         return ua;
     }
 
-    private long epochSeconds() {
-        return System.currentTimeMillis() / 1000L;
+    @FunctionalInterface
+    private interface SnapshotLoader {
+        void load(JSONObject data) throws JSONException;
     }
 
     // ---------- DTOs ----------

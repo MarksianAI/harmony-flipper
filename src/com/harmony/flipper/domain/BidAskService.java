@@ -3,9 +3,9 @@ package com.harmony.flipper.domain;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.harmony.flipper.config.Config;
-import com.harmony.flipper.util.NumberUtils;
 import com.harmony.flipper.data.ItemInfo;
 import com.harmony.flipper.data.PriceData;
+import com.harmony.flipper.util.NumberUtils;
 import org.rspeer.commons.logging.Log;
 import org.rspeer.event.Service;
 import org.rspeer.event.Subscribe;
@@ -19,14 +19,13 @@ public final class BidAskService implements Service {
 
     private final FlipService flipService;
     private final Config config;
-
     private volatile List<Candidate> lastSnapshot = List.of();
 
     public static final class Candidate {
         public final int itemId;
         public final String name;
-        public final int low;     // insta-sell (our buy)
-        public final int high;    // insta-buy (our sell)
+        public final int low;
+        public final int high;
         public final int volume24h;
         public final double spreadPct;
         public final double netSpreadPct;
@@ -35,8 +34,8 @@ public final class BidAskService implements Service {
         public final int plannedBuyQty;
 
         Candidate(int itemId, String name, int low, int high, int volume24h,
-                  double spreadPct, double netSpreadPct,
-                  int netProfitPerUnit, double netRoiPct, int plannedBuyQty) {
+                  double spreadPct, double netSpreadPct, int netProfitPerUnit, double netRoiPct,
+                  int plannedBuyQty) {
             this.itemId = itemId;
             this.name = name;
             this.low = low;
@@ -61,91 +60,99 @@ public final class BidAskService implements Service {
         if (!flipService.isReady()) return;
 
         try {
-            List<Candidate> candidates = computeCandidates();
-            // Keep only top N by total profit potential (unit * plannedQty)
+            List<Candidate> rows = new ArrayList<>();
+            for (int id : flipService.getItemIds()) {
+                Candidate c = buildCandidate(id);
+                if (c != null) rows.add(c);
+            }
             int maxPositions = Math.max(1, config.strategies.spread.maxOpenPositions);
-            this.lastSnapshot = candidates.stream()
+            lastSnapshot = rows.stream()
                     .sorted(Comparator.<Candidate>comparingLong(c -> (long) c.netProfitPerUnit * c.plannedBuyQty).reversed())
-                    .limit(maxPositions * 2L) // a little buffer
+                    .limit(maxPositions * 2L)
                     .collect(Collectors.toUnmodifiableList());
         } catch (Exception ex) {
             Log.severe("BidAskService: compute failed: " + ex.getMessage());
         }
     }
 
-    public List<Candidate> getSnapshot() {
-        return lastSnapshot;
+    public List<Candidate> getSnapshot() { return lastSnapshot; }
+
+    private Candidate buildCandidate(int itemId) {
+        var mapping = flipService.getItemMapping();
+        var latest  = flipService.getLatestPrices();
+        var volumes = flipService.getItemVolumes();
+
+        ItemInfo info = mapping.get(itemId);
+        PriceData p   = latest.get(itemId);
+        Integer vol   = volumes.get(itemId);
+
+        if (info == null || p == null || vol == null) return null;
+        if (!passesFilters(info, vol, p.low)) return null;
+
+        int low  = p.low;
+        int high = p.high;
+        if (high <= low) return null;
+
+        double rawSpreadPct = pct(high - low, low);
+        int netSell = netSellPrice(high);
+        int netPer  = netSell - low;
+        if (netPer <= 0) return null;
+
+        double netSpreadPct = pct(netSell - low, low);
+        double netRoiPct    = pct(netPer, low);
+        if (!passesPnLGates(rawSpreadPct, netSpreadPct, netPer, netRoiPct)) return null;
+
+        int plannedQty = plannedQuantity(low, info.limit);
+        if (plannedQty <= 0) return null;
+
+        return new Candidate(
+                itemId, info.name, low, high, vol,
+                NumberUtils.round2(rawSpreadPct),
+                NumberUtils.round2(netSpreadPct),
+                netPer,
+                NumberUtils.round2(netRoiPct),
+                plannedQty
+        );
     }
 
-    // ---------- internals ----------
+    private boolean passesFilters(ItemInfo info, int volume24h, int unitPrice) {
+        if (config.filters.membersOnly && !info.members) return false;
+        if (volume24h < Math.max(0, config.filters.minVolume)) return false;
+        int limit = info.limit != null ? info.limit : Integer.MAX_VALUE;
+        if (limit < Math.max(0, config.filters.minBuyLimit)) return false;
+        if (unitPrice > Math.max(1, config.risk.maxPricePerUnit)) return false;
+        return true;
+    }
 
-    private List<Candidate> computeCandidates() {
-        Map<Integer, ItemInfo> mapping = flipService.getItemMapping();
-        Map<Integer, PriceData> latest = flipService.getLatestPrices();
-        Map<Integer, Integer> volumes = flipService.getItemVolumes();
+    private boolean passesPnLGates(double spreadPct, double netSpreadPct, int netPerUnit, double netRoiPct) {
+        if (spreadPct < Math.max(0.0, config.strategies.spread.minSpreadPercent)) return false;
+        if (netSpreadPct < Math.max(0.0, config.strategies.spread.minNetSpreadPercent)) return false;
+        if (netPerUnit < Math.max(0, config.strategies.spread.minNetProfitGp)) return false;
+        if (netRoiPct < Math.max(0.0, config.strategies.spread.minNetRoiPercent)) return false;
+        return true;
+    }
 
-        boolean membersOnly = config.filters.membersOnly;
-        int minVolume = Math.max(0, config.filters.minVolume);
-        int minBuyLimit = Math.max(0, config.filters.minBuyLimit);
+    private int plannedQuantity(int unitPrice, Integer buyLimitNullable) {
+        int maxCap     = Math.max(1, config.risk.maxCapitalPerItem);
+        double utilPct = clamp(config.risk.buyLimitUtilizationPercent, 1.0, 100.0);
+        int limit      = buyLimitNullable != null ? buyLimitNullable : Integer.MAX_VALUE;
 
-        double minSpreadPct    = Math.max(0.0, config.strategies.spread.minSpreadPercent);
-        double minNetSpreadPct = Math.max(0.0, config.strategies.spread.minNetSpreadPercent);
-        int minNetProfit       = Math.max(0, config.strategies.spread.minNetProfitGp);
-        double minNetRoi       = Math.max(0.0, config.strategies.spread.minNetRoiPercent);
+        int byCapital  = Math.max(0, maxCap / Math.max(1, unitPrice));
+        int byLimit    = (int) Math.floor(limit * (utilPct / 100.0));
+        return Math.min(byCapital, byLimit);
+    }
 
-        int maxUnitPrice       = Math.max(1, config.risk.maxPricePerUnit);
-        int maxCapPerItem      = Math.max(1, config.risk.maxCapitalPerItem);
-        double feeSlipPct      = Math.max(0.0, config.risk.feeSlippagePercent);
-        double buyLimitUtilPct = Math.min(100.0, Math.max(1.0, config.risk.buyLimitUtilizationPercent));
+    private int netSellPrice(int high) {
+        double feeSlipPct = Math.max(0.0, config.risk.feeSlippagePercent);
+        return (int) Math.floor(high * (1.0 - feeSlipPct / 100.0));
+    }
 
-        List<Candidate> out = new ArrayList<>(128);
+    private static double pct(int num, int denom) {
+        if (denom <= 0) return 0.0;
+        return (num * 100.0) / denom;
+    }
 
-        for (int itemId : flipService.getItemIds()) {
-            PriceData p = latest.get(itemId);
-            ItemInfo info = mapping.get(itemId);
-            Integer volDay = volumes.get(itemId);
-            if (p == null || info == null || volDay == null) continue;
-
-            if (membersOnly && !info.members) continue;
-            if (volDay < minVolume) continue;
-
-            // Respect buy limit floor (skip super-low limits)
-            int buyLimit = info.limit != null ? info.limit : Integer.MAX_VALUE;
-            if (buyLimit < minBuyLimit) continue;
-
-            int low = p.low;   // our buy
-            int high = p.high; // our sell
-            if (low <= 0 || high <= 0 || high <= low) continue;
-
-            if (low > maxUnitPrice) continue;
-
-            double spreadPct = ((high - low) * 100.0) / low;
-
-            // Net-out friction (sale tax + expected slippage/undercuts)
-            int netSell = (int) Math.floor(high * (1.0 - feeSlipPct / 100.0));
-            int netProfitPerUnit = netSell - low;
-            if (netProfitPerUnit <= 0) continue;
-
-            double netRoiPct = (netProfitPerUnit * 100.0) / low;
-            double netSpreadPct = ((netSell - low) * 100.0) / low;
-
-            if (spreadPct < minSpreadPct) continue;
-            if (netSpreadPct < minNetSpreadPct) continue;
-            if (netProfitPerUnit < minNetProfit) continue;
-            if (netRoiPct < minNetRoi) continue;
-
-            // Plan quantity under capital + buy-limit utilization
-            int qtyByCapital = Math.max(0, maxCapPerItem / Math.max(1, low));
-            int qtyByLimit   = (int) Math.floor(buyLimit * (buyLimitUtilPct / 100.0));
-            int plannedQty   = Math.min(qtyByCapital, qtyByLimit);
-            if (plannedQty <= 0) continue;
-
-            out.add(new Candidate(
-                    itemId, info.name, low, high, volDay,
-                    NumberUtils.round2(spreadPct), NumberUtils.round2(netSpreadPct),
-                    netProfitPerUnit, NumberUtils.round2(netRoiPct), plannedQty
-            ));
-        }
-        return out;
+    private static double clamp(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 }

@@ -5,6 +5,7 @@ import com.google.inject.Singleton;
 import com.harmony.flipper.config.Config;
 import com.harmony.flipper.data.ItemInfo;
 import com.harmony.flipper.data.PriceData;
+import com.harmony.flipper.util.DoubleRingBuffer;
 import com.harmony.flipper.util.NumberUtils;
 import org.rspeer.commons.logging.Log;
 import org.rspeer.event.Service;
@@ -12,6 +13,7 @@ import org.rspeer.event.Subscribe;
 import org.rspeer.game.event.TickEvent;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Singleton
@@ -19,22 +21,22 @@ public final class MeanReversionService implements Service {
 
     private final FlipService flipService;
     private final Config config;
-
+    private final Map<Integer, DoubleRingBuffer> lowPriceBuffers = new ConcurrentHashMap<>();
     private volatile List<Candidate> lastSnapshot = List.of();
 
     public static final class Candidate {
         public final int itemId;
         public final String name;
         public final int currentLow;
-        public final int avgLow24h;
-        public final double deviationPct; // positive = below mean
+        public final double baseline;
+        public final double deviationPct;
         public final int plannedBuyQty;
 
-        Candidate(int itemId, String name, int currentLow, int avgLow24h, double deviationPct, int plannedBuyQty) {
+        Candidate(int itemId, String name, int currentLow, double baseline, double deviationPct, int plannedBuyQty) {
             this.itemId = itemId;
             this.name = name;
             this.currentLow = currentLow;
-            this.avgLow24h = avgLow24h;
+            this.baseline = baseline;
             this.deviationPct = deviationPct;
             this.plannedBuyQty = plannedBuyQty;
         }
@@ -48,16 +50,33 @@ public final class MeanReversionService implements Service {
 
     @Subscribe
     public void onTick(TickEvent tick) {
-        if (!config.strategies.meanReversion.enable) {
-            lastSnapshot = List.of();
-            return;
-        }
+        if (!config.strategies.meanReversion.enable) return;
         if (!flipService.isReady()) return;
 
+        var latest = flipService.getLatestPrices();
+        var items  = flipService.getItemMapping();
+        int lookback = Math.max(5, config.strategies.meanReversion.lookbackTicks);
+        int bbLook   = Math.max(5, config.strategies.meanReversion.bbLookbackTicks);
+        int cap      = Math.max(lookback, bbLook);
+        for (var e : latest.entrySet()) {
+            int id = e.getKey();
+            PriceData p = e.getValue();
+            if (p == null || p.low <= 0) continue;
+            if (!items.containsKey(id)) continue;
+
+            DoubleRingBuffer buf = lowPriceBuffers.computeIfAbsent(id, k -> new DoubleRingBuffer(cap));
+            if (buf.capacity() != cap) lowPriceBuffers.put(id, buf = new DoubleRingBuffer(cap));
+            buf.add(p.low);
+        }
+
         try {
-            List<Candidate> candidates = computeCandidates();
+            List<Candidate> rows = new ArrayList<>();
+            for (int id : flipService.getItemIds()) {
+                Candidate c = candidateFor(id);
+                if (c != null) rows.add(c);
+            }
             int maxPositions = Math.max(1, config.strategies.meanReversion.maxPositions);
-            this.lastSnapshot = candidates.stream()
+            lastSnapshot = rows.stream()
                     .sorted(Comparator.comparingDouble((Candidate c) -> c.deviationPct).reversed())
                     .limit(maxPositions * 2L)
                     .collect(Collectors.toUnmodifiableList());
@@ -66,64 +85,92 @@ public final class MeanReversionService implements Service {
         }
     }
 
-    public List<Candidate> getSnapshot() {
-        return lastSnapshot;
+    public List<Candidate> getSnapshot() { return lastSnapshot; }
+
+    private Candidate candidateFor(int itemId) {
+        var mapping = flipService.getItemMapping();
+        var latest  = flipService.getLatestPrices();
+        var volumes = flipService.getItemVolumes();
+        var day     = flipService.getPrices24h();
+
+        ItemInfo info = mapping.get(itemId);
+        PriceData p   = latest.get(itemId);
+        Integer vol   = volumes.get(itemId);
+        if (info == null || p == null || vol == null) return null;
+        if (!passesFilters(info, vol, p.low)) return null;
+
+        Baseline bl = computeBaseline(itemId, p.low, day.get(itemId));
+        if (bl == null) return null;
+        if (bl.deviationPct < Math.max(0.0, config.strategies.meanReversion.entryDeviationPercent)) return null;
+
+        int target = (int) Math.floor(bl.baseline * (1.0 - Math.max(0.0, config.strategies.meanReversion.exitDeviationPercent) / 100.0));
+        int expPer = target - p.low;
+        if (expPer < Math.max(0, config.strategies.meanReversion.minNetProfitGp)) return null;
+
+        int planned = plannedQuantity(p.low, info.limit);
+        if (planned <= 0) return null;
+
+        return new Candidate(itemId, info.name, p.low, NumberUtils.round2(bl.baseline),
+                NumberUtils.round2(bl.deviationPct), planned);
     }
 
-    // ---------- internals ----------
+    private boolean passesFilters(ItemInfo info, int vol, int unitPrice) {
+        if (config.filters.membersOnly && !info.members) return false;
+        if (vol < Math.max(0, config.filters.minVolume)) return false;
+        int limit = info.limit != null ? info.limit : Integer.MAX_VALUE;
+        if (limit < Math.max(0, config.filters.minBuyLimit)) return false;
+        if (unitPrice <= 0 || unitPrice > Math.max(1, config.risk.maxPricePerUnit)) return false;
+        return true;
+    }
 
-    private List<Candidate> computeCandidates() {
-        Map<Integer, ItemInfo> mapping = flipService.getItemMapping();
-        Map<Integer, PriceData> latest = flipService.getLatestPrices();
-        Map<Integer, Integer> volumes = flipService.getItemVolumes();
-        Map<Integer, FlipService.IntervalData> day = flipService.getPrices24h();
+    private int plannedQuantity(int unitPrice, Integer limitNullable) {
+        int maxCap = Math.max(1, config.risk.maxCapitalPerItem);
+        double util = Math.max(1.0, Math.min(100.0, config.risk.buyLimitUtilizationPercent));
+        int limit = limitNullable != null ? limitNullable : Integer.MAX_VALUE;
+        int byCap = Math.max(0, maxCap / Math.max(1, unitPrice));
+        int byLim = (int) Math.floor(limit * (util / 100.0));
+        return Math.min(byCap, byLim);
+    }
 
-        boolean membersOnly = config.filters.membersOnly;
-        int minVolume = Math.max(0, config.filters.minVolume);
-        int minBuyLimit = Math.max(0, config.filters.minBuyLimit);
+    private static final class Baseline {
+        final double baseline; final double deviationPct;
+        Baseline(double baseline, double deviationPct) { this.baseline = baseline; this.deviationPct = deviationPct; }
+    }
 
-        double entryDev = Math.max(0.0, config.strategies.meanReversion.entryDeviationPercent);
-        int minProfitGp = Math.max(0, config.strategies.meanReversion.minNetProfitGp); // from our adjusted config
-        int maxUnitPrice = Math.max(1, config.risk.maxPricePerUnit);
-        int maxCapPerItem = Math.max(1, config.risk.maxCapitalPerItem);
-        double buyLimitUtilPct = Math.min(100.0, Math.max(1.0, config.risk.buyLimitUtilizationPercent));
+    private Baseline computeBaseline(int itemId, int currentLow, FlipService.IntervalData day) {
+        DoubleRingBuffer buf = lowPriceBuffers.get(itemId);
+        boolean useBB = config.strategies.meanReversion.useBollinger;
+        int bbLook = Math.max(5, config.strategies.meanReversion.bbLookbackTicks);
+        int smaLook = Math.max(5, config.strategies.meanReversion.lookbackTicks);
 
-        List<Candidate> out = new ArrayList<>(64);
-
-        for (int itemId : flipService.getItemIds()) {
-            ItemInfo info = mapping.get(itemId);
-            PriceData p = latest.get(itemId);
-            Integer vol = volumes.get(itemId);
-            FlipService.IntervalData d = day.get(itemId);
-            if (info == null || p == null || vol == null || d == null) continue;
-
-            if (membersOnly && !info.members) continue;
-            if (vol < minVolume) continue;
-            int buyLimit = info.limit != null ? info.limit : Integer.MAX_VALUE;
-            if (buyLimit < minBuyLimit) continue;
-
-            int currentLow = p.low;
-            int avgLow24h  = d.avgLowPrice;
-            if (currentLow <= 0 || avgLow24h <= 0) continue;
-            if (currentLow > maxUnitPrice) continue;
-
-            // Deviation: how far below 24h mean (positive = below mean)
-            double deviationPct = (avgLow24h - currentLow) * 100.0 / avgLow24h;
-            if (deviationPct < entryDev) continue;
-
-            // Simple profit floor: require at least X gp expected bounce (use exitDeviation as "mean target")
-            double exitDev = Math.max(0.0, config.strategies.meanReversion.exitDeviationPercent);
-            int targetPrice = (int) Math.floor(avgLow24h * (1.0 - exitDev / 100.0));
-            int expProfitPerUnit = targetPrice - currentLow;
-            if (expProfitPerUnit < minProfitGp) continue;
-
-            int qtyByCapital = Math.max(0, maxCapPerItem / Math.max(1, currentLow));
-            int qtyByLimit   = (int) Math.floor(buyLimit * (buyLimitUtilPct / 100.0));
-            int plannedQty   = Math.min(qtyByCapital, qtyByLimit);
-            if (plannedQty <= 0) continue;
-
-            out.add(new Candidate(itemId, info.name, currentLow, avgLow24h, NumberUtils.round2(deviationPct), plannedQty));
+        if (useBB && buf != null) {
+            int bbSamples = Math.min(bbLook, buf.size());
+            if (bbSamples >= 5) {
+                double sma = buf.mean(bbSamples);
+                double std = buf.std(bbSamples);
+                double lowerBand = sma - Math.max(0.5, config.strategies.meanReversion.bbStdDevs) * std;
+                double entryPct = Math.max(0.0, config.strategies.meanReversion.entryDeviationPercent);
+                double entryThreshold = Math.max(lowerBand, sma * (1.0 - entryPct / 100.0));
+                if (currentLow > entryThreshold) return null;
+                return new Baseline(sma, pct(sma - currentLow, sma));
+            }
         }
-        return out;
+
+        if (buf != null) {
+            int smaSamples = Math.min(smaLook, buf.size());
+            if (smaSamples >= 5) {
+                double sma = buf.mean(smaSamples);
+                return new Baseline(sma, pct(sma - currentLow, sma));
+            }
+        }
+
+        if (day == null || day.avgLowPrice <= 0) return null;
+        double base = day.avgLowPrice;
+        return new Baseline(base, pct(base - currentLow, base));
+    }
+
+    private static double pct(double num, double denom) {
+        if (denom <= 0) return 0.0;
+        return (num * 100.0) / denom;
     }
 }
