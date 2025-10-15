@@ -2,9 +2,6 @@ package com.harmony.flipper;
 
 
 import com.harmony.flipper.config.Config;
-import com.harmony.flipper.domain.*;
-import com.harmony.flipper.task.BuyTask;
-import com.harmony.flipper.task.SellTask;
 import org.rspeer.commons.ArrayUtils;
 import org.rspeer.event.Service;
 import org.rspeer.game.script.Task;
@@ -14,7 +11,7 @@ import org.rspeer.game.script.meta.ScriptMeta;
 @ScriptMeta(
         name = "HarmonyFlipper",
         developer = "Harmony",
-        desc = "Flip framework using Inubot services",
+        desc = "Flips in harmony",
         version = 1.0,
         model = Config.class
 )
@@ -23,19 +20,14 @@ public class Flipper extends TaskScript {
     @Override
     public Class<? extends Service>[] getServices() {
         return ArrayUtils.getTypeSafeArray(
-                FlipService.class,
-                BidAskService.class,
-                MeanReversionService.class,
-                PairDiscoveryService.class,
-                PairTradingService.class
+
         );
     }
 
     @Override
     public Class<? extends Task>[] tasks() {
         return ArrayUtils.getTypeSafeArray(
-                BuyTask.class,
-                SellTask.class
+
         );
     }
 
