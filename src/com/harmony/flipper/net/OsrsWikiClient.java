@@ -14,7 +14,6 @@ import com.harmony.flipper.net.transport.OsrsWikiTransport.RawVolumeResponse;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -64,17 +63,10 @@ public final class OsrsWikiClient {
     }
 
     public Response.Timeseries getTimeseries(int itemId, Time.Step step) {
-        return getTimeseries(itemId, step, null);
-    }
-
-    public Response.Timeseries getTimeseries(int itemId, Time.Step step, Instant since) {
         Objects.requireNonNull(step, "step");
         Map<String, String> params = new LinkedHashMap<>();
         params.put("id", Integer.toString(itemId));
         params.put("timestep", step.getValue());
-        if (since != null) {
-            params.put("timestamp", Long.toString(since.getEpochSecond()));
-        }
         RawTimeseriesResponse raw = transport.fetchTimeseries(params);
         int resolvedId = raw != null ? raw.itemId : itemId;
         return Response.Timeseries.fromRaw(resolvedId, raw != null ? raw.data : null);
@@ -84,7 +76,7 @@ public final class OsrsWikiClient {
         return transport.fetchMapping();
     }
 
-    public Snapshot getFullSnapshot(Iterable<Integer> timeseriesItemIds, Time.Step step, Instant since) {
+    public Snapshot getFullSnapshot(Iterable<Integer> timeseriesItemIds, Time.Step step) {
         List<Integer> ids = new ArrayList<>();
         if (timeseriesItemIds != null) {
             for (Integer id : timeseriesItemIds) {
@@ -103,7 +95,7 @@ public final class OsrsWikiClient {
         Map<Integer, Response.Timeseries> series = new LinkedHashMap<>();
         if (!ids.isEmpty() && step != null) {
             for (Integer id : ids) {
-                series.put(id, getTimeseries(id, step, since));
+                series.put(id, getTimeseries(id, step));
             }
         }
 
